@@ -13,6 +13,8 @@ import scipy as sp
 from pauli import *
 import copy
 import matplotlib.pyplot as plt
+from math import comb
+import matplotlib.colors as mcolors
 
 class SurrogateModel:
     """
@@ -35,11 +37,12 @@ class SurrogateModel:
     overlap: np.ndarray
     reduced_terms: list[np.ndarray]
     particle_selection: tuple[int, int] | int = None
+    size: int
 
     def __init__(
         self,
         N: int,
-        pauli_strings: list[str],
+        pauli_strings: list[str] | tuple[tuple[int, str]],
         training_grid: list[list[complex]],
         particle_selection: tuple[int, int] | int = None
     ):
@@ -53,12 +56,19 @@ class SurrogateModel:
         self.overlap = None
         self.reduced_terms = None
         self.particle_selection = particle_selection
+        if type(self.particle_selection) == type(None):
+            self.size = 2**N
+        elif type(self.particle_selection) == int:
+            self.size = comb(N, self.particle_selection)
 
     def build_terms(
         self
     ):
         self.H_terms = []
         for pauli_string in self.pauli_strings:
+            H = gen_from_pauli_string(
+                self.N, pauli_string, self.particle_selection
+            )
             self.H_terms.append(
                 gen_from_pauli_string(
                     self.N, pauli_string, self.particle_selection
@@ -77,12 +87,13 @@ class SurrogateModel:
                 for mu_j in mu:
                     bulk.append(mu_i * mu_j)
             self.training_grid2.append(bulk)
+        print(self.training_grid2)
 
     def _build_H_full(
         self,
         parameter_idx: int
     ) -> np.ndarray:
-        H_full = np.zeros((2**self.N, 2**self.N), dtype=complex)
+        H_full = np.zeros((self.size, self.size), dtype=complex)
         for p, h in zip(self.training_grid[parameter_idx], self.H_terms):
             H_full += p * h
 
@@ -92,7 +103,7 @@ class SurrogateModel:
         self,
         parameter_idx: int
     ) -> np.ndarray:
-        H2_full = np.zeros((2**self.N, 2**self.N), dtype=complex)
+        H2_full = np.zeros((self.size, self.size), dtype=complex)
         for mu2_i, h2_i in zip(
             self.training_grid2[parameter_idx],
             self.H2_terms
@@ -105,8 +116,15 @@ class SurrogateModel:
         self,
         residue_threshold: int = 1,
         init_vec: np.ndarray = None,
-        solution_grid: np.ndarray = None
+        solution_grid: np.ndarray = None,
+        log_file = None
     ):
+        if log_file:
+            log_file = open(log_file, "w")
+            log_file.write("# Parameter Set\n")
+            for mu in self.training_grid:
+                log_file.write(str(mu)+"\n")
+            
         # build terms if they are not already built
         if (
             type(self.H_terms) == type(None)
@@ -134,12 +152,13 @@ class SurrogateModel:
 
         basis_list = [init_vec]
         basis = np.array(basis_list).T
+        print(init_vec)
 
         if type(solution_grid) != type(None):
             answer_grid = np.zeros(solution_grid.shape, dtype=complex)
             for y in range(solution_grid.shape[0]):
                 for x in range(solution_grid.shape[1]):
-                    H_full = self._build_H_full(y * 10 + x)
+                    H_full = self._build_H_full(y * solution_grid.shape[1] + x)
                     Hr = basis.conj().T @ H_full @ basis
                     overlap = basis.conj().T @ basis
                     evals, evecs = sp.linalg.eigh(Hr, overlap)
@@ -163,8 +182,8 @@ class SurrogateModel:
                 # construct Hr and H2r
                 # technically H_full and H2_full only need to be constructed
                 # once, however, due to possible memory limitations based on
-                # the trianing grid size and full Hilbert space size, these are
-                # constructed on demand
+                # the trianing grid size and full Hilbert space size, these
+                # are constructed on demand
                 H_full = self._build_H_full(j)
                 H2_full = self._build_H2_full(j)
 
@@ -173,7 +192,7 @@ class SurrogateModel:
                 evals, evecs = sp.linalg.eigh(Hr, overlap)
 
                 # find degeneracy of the ground state
-                eps = 1e-7 # for comparing floating points of GSE
+                eps = 1e-8 # for comparing floating points of GSE
                 degeneracy = 0
                 for e in evals:
                     if e - evals[0] < eps:
@@ -184,11 +203,15 @@ class SurrogateModel:
                 # calculate residue
                 res2 = 0
                 for k in range(degeneracy):
+                    print(evals)
                     res2 += (
                         evecs[:, k].conj().T
                         @ (H2r - evals[k] * evals[k] * overlap)
                         @ evecs[:, k]
                     )
+                print("Residue:", res2)
+                if(res2 < -1e-7):
+                    print("Fail")
 
                 if res2 > max_res2:
                     max_res2 = res2
@@ -198,7 +221,7 @@ class SurrogateModel:
             print("Max Residue", max_res2)
             evals, evecs = np.linalg.eigh(chosen_H_full)
             # find degeneracy of the ground state
-            eps = 1e-7 # for comparing floating points of GSE
+            eps = 1e-8 # for comparing floating points of GSE
             degeneracy = 0
             for e in evals:
                 if e - evals[0] < eps:
@@ -221,7 +244,6 @@ class SurrogateModel:
                 else:
                     break
 
-            basis_list = copy.deepcopy(basis_list)
             for j in range(compress_add):
                 basis_list += [U[:, j]]
             basis = np.array(basis_list).T
@@ -230,28 +252,44 @@ class SurrogateModel:
                 answer_grid = np.zeros(solution_grid.shape, dtype=complex)
                 for y in range(solution_grid.shape[0]):
                     for x in range(solution_grid.shape[1]):
-                        H_full = self._build_H_full(y * 10 + x)
+                        H_full = self._build_H_full(
+                            y * solution_grid.shape[1] + x
+                        )
                         Hr = basis.conj().T @ H_full @ basis
                         overlap = basis.conj().T @ basis
                         evals, evecs = sp.linalg.eigh(Hr, overlap)
                         answer_grid[y, x] = evals[0]
-
-                plt.imshow(np.abs((answer_grid - solution_grid).real))
-                plt.xlabel("Bz")
-                plt.ylabel("J")
+                plt.imshow(
+                    np.abs((answer_grid - solution_grid).real) + 1e-20,
+                    norm=mcolors.LogNorm(vmin=1e-20, vmax=1),
+                )
+                plt.colorbar(
+                    norm=mcolors.LogNorm(
+                        vmin=1e-20, vmax=1
+                    )  # , ticks=[1e-20, 1e-10, 1e0]
+                )
+                plt.annotate("X", xy=(next_choice % 20, next_choice // 20))
+                plt.xlabel("U")
+                plt.ylabel("t")
                 plt.title(f"It {i + 1}")
-                plt.colorbar()
                 plt.show()
 
             not_chosen.remove(next_choice)
             chosen.append(next_choice)
+            print(chosen)
 
-            if max_res2 < residue_threshold or len(chosen) >= 2**self.N - 1:
+            if max_res2 < residue_threshold or len(chosen) >= self.size - 1:
                 break
 
         self.opt_basis = basis
         self.overlap = basis.conj().T @ basis
+        plt.imshow(self.overlap.real)
+        plt.colorbar()
+        plt.show()
         self.reduced_terms = None
+
+        if log_file:
+            log_file.close()
 
         return chosen, basis
     
@@ -282,55 +320,4 @@ class SurrogateModel:
         
         evals, evecs = sp.linalg.eigh(Hr, self.overlap)
         
-        return evals[0]
-
-if __name__ == "__main__":
-    mu = np.linspace(-3, 3, 10)
-
-    training_grid = np.array([
-        (i, i, i, i, i, i, j, j, j, j, j, j)
-        for i in mu
-        for j in mu
-    ])
-    
-    H_paulis = [
-        "X0X1", "X1X2", "X2X3", "X3X4", "X4X5", "X0X5",
-        "Z0", "Z1", "Z2", "Z3", "Z4", "Z5"
-    ]
-    model = SurrogateModel(
-        6,
-        H_paulis,
-        training_grid,
-        particle_selection=3
-    )
-
-    model.build_terms()
-
-    # calc real solutions
-    solution_grid = np.zeros((10, 10), dtype=complex)
-    for i in range(10):
-        for j in range(10):
-            H_full = np.zeros((20, 20), dtype=complex)
-            parameters = training_grid[i * 10 + j]
-            for k, h in enumerate(model.H_terms):
-                H_full += parameters[k] * h
-            evals, evecs = np.linalg.eigh(H_full)
-            solution_grid[i, j] = evals[0]
-
-    print(model.optimize(solution_grid=None))
-
-    for i in range(30):
-        H_full = np.zeros((2**6, 2**6), dtype=complex)
-
-        (J, Bz) = 3 * np.random.randn(2)
-        parameters = [J, J, J, J, J, J, Bz, Bz, Bz, Bz, Bz, Bz]
-        for i, h in enumerate(model.H_terms):
-            H_full += parameters[i] * h
-
-        evals, evecs = np.linalg.eigh(H_full)
-
-        print(parameters)
-        print("Real", evals[0])
-        print("Approx", model.solve(parameters))
-        print("Diff", np.abs(evals[0] - model.solve(parameters)))
-        print()
+        return evals[0]#, self.opt_basis @ evecs[:, 0]

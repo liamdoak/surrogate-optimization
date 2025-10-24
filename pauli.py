@@ -100,14 +100,26 @@ def get_ps_basis(
             np.savetxt(basis_file, basis, fmt="%d")
             return basis
 
+def parse_openfermion_term(
+    term: tuple[int, str]
+) -> str:
+    string = ""
+    for factor in term:
+        string += factor[1] + str(factor[0])
+
+    return pauli_strings
+
 def gen_from_pauli_string(
     N: int,
-    pauli_string: str,
+    pauli_string: str | tuple[int, str],
     particle_selection: tuple[int] | int = None
 ) -> np.ndarray:
+    if type(pauli_string) != str:
+        pauli_string = parse_openfermion_term(pauli_string)
 
     next_location = 0
     mat = np.eye(1)
+
     for i in np.arange(0, len(pauli_string), 2):
         for j in range(int(pauli_string[i + 1]) - next_location):
             mat = np.kron(mat, Pauli.I)
