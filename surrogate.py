@@ -1,20 +1,12 @@
-# Bring up to Norman
-# Particle Selection?
-#  - get_ps_basis
-#  - get_occupied_indices
-#  - H[:,basis][basis[
-# any good hamiltonians to test with?
-##### allow "fixing" some parameters?
-# multithreading (possibly with Python 3.14?)
-# JIT (possibly with Python 3.14?)
-
 import numpy as np
 import scipy as sp
+import scipy.sparse as sps
 from pauli import *
 import copy
 import matplotlib.pyplot as plt
 from math import comb
 import matplotlib.colors as mcolors
+import openfermion as of
 
 class SurrogateModel:
     """
@@ -27,51 +19,71 @@ class SurrogateModel:
         pauli_strings: `list[str]`
             A list of Pauli strings that comprise the Hamiltonian
     """
+
+    _SPARSE_LIMIT: int
+
     N: int
     pauli_strings: list[str]
     H_terms: list[np.ndarray]
     H2_terms: list[np.ndarray]
+    H_fulls: list[np.ndarray]
+    H2_fulls: list[np.ndarray]
     training_grid: list[list[complex]]
     training_grid2: list[list[complex]]
     opt_basis: np.ndarray
     overlap: np.ndarray
     reduced_terms: list[np.ndarray]
     particle_selection: tuple[int, int] | int = None
+    basis_ordering: str
+    sparse: bool
     size: int
 
     def __init__(
         self,
         N: int,
-        pauli_strings: list[str] | tuple[tuple[int, str]],
+        pauli_strings: list[str],
         training_grid: list[list[complex]],
-        particle_selection: tuple[int, int] | int = None
+        particle_selection: tuple[int, int] | int = None,
+        basis_ordering: str = "uudd",
     ):
+        self._SPARSE_LIMIT = 8
         self.N = N
+        if self.N > self._SPARSE_LIMIT:
+            self.sparse = True
+        else:
+            self.sparse = False
+
         self.pauli_strings = pauli_strings
         self.H_terms = None
         self.H2_terms = None
+        self.H_fulls = None
+        self.H2_fulls = None
         self.training_grid = training_grid
         self.training_grid2 = None
         self.opt_basis = None
         self.overlap = None
         self.reduced_terms = None
         self.particle_selection = particle_selection
+        self.basis_ordering = basis_ordering
+
         if type(self.particle_selection) == type(None):
             self.size = 2**N
         elif type(self.particle_selection) == int:
             self.size = comb(N, self.particle_selection)
 
     def build_terms(
-        self
+        self,
+        pregenerate_fulls: bool = False
     ):
         self.H_terms = []
         for pauli_string in self.pauli_strings:
-            H = gen_from_pauli_string(
-                self.N, pauli_string, self.particle_selection
-            )
             self.H_terms.append(
                 gen_from_pauli_string(
-                    self.N, pauli_string, self.particle_selection
+                    self.N,
+                    pauli_string,
+                    self.particle_selection,
+                    ordering=self.basis_ordering,
+                    sparse=self.sparse
                 ),
             )
 
@@ -87,7 +99,13 @@ class SurrogateModel:
                 for mu_j in mu:
                     bulk.append(mu_i * mu_j)
             self.training_grid2.append(bulk)
-        print(self.training_grid2)
+
+        if pregenerate_fulls:
+            self.H_fulls = []
+            self.H2_fulls = []
+            for i in range(len(self.training_grid)):
+                self.H_fulls.append(self._build_H_full(i))
+                self.H2_fulls.append(self._build_H2_full(i))
 
     def _build_H_full(
         self,
@@ -103,28 +121,27 @@ class SurrogateModel:
         self,
         parameter_idx: int
     ) -> np.ndarray:
+        """
         H2_full = np.zeros((self.size, self.size), dtype=complex)
         for mu2_i, h2_i in zip(
             self.training_grid2[parameter_idx],
             self.H2_terms
         ):
             H2_full += mu2_i * h2_i
+        """
+        
+        H_full = self._build_H_full(parameter_idx)
 
-        return H2_full
+        return H_full @ H_full
 
     def optimize(
         self,
-        residue_threshold: int = 1,
+        residue_threshold: float = 1e-6,
         init_vec: np.ndarray = None,
-        solution_grid: np.ndarray = None,
-        log_file = None
+        solution_grid: tuple[np.ndarray, np.ndarray] = None,
+        svd_tolerance: float = 1e-8,
+        degeneracy_truncation: int = 5,
     ):
-        if log_file:
-            log_file = open(log_file, "w")
-            log_file.write("# Parameter Set\n")
-            for mu in self.training_grid:
-                log_file.write(str(mu)+"\n")
-            
         # build terms if they are not already built
         if (
             type(self.H_terms) == type(None)
@@ -139,79 +156,81 @@ class SurrogateModel:
         # list of remaining indices into the training grid
         not_chosen = list(range(len(self.training_grid)))
 
-        # list of ill-conditioned choices
-        dont_choose = []
-
         # initial vector is not provided, so we choose from the training grid
-        if init_vec == None:
-            H_full = self._build_H_full(0)
-            evals, evecs = sp.linalg.eigh(H_full)
+        if type(init_vec) == type(None):
+            if type(self.H_fulls) == type(None):
+                H_full = self._build_H_full(0)
+            else:
+                H_full = self.H_fulls[0]
+            if self.sparse:
+                evals_evecs = sps.linalg.eigh(H_full)
+            else:
+                evals, evecs = sp.linalg.eigh(H_full)
             init_vec = evecs[:, 0]
             chosen.append(0)
             not_chosen.remove(0)
 
         basis_list = [init_vec]
         basis = np.array(basis_list).T
-        print(init_vec)
 
         if type(solution_grid) != type(None):
-            answer_grid = np.zeros(solution_grid.shape, dtype=complex)
-            for y in range(solution_grid.shape[0]):
-                for x in range(solution_grid.shape[1]):
-                    H_full = self._build_H_full(y * solution_grid.shape[1] + x)
-                    Hr = basis.conj().T @ H_full @ basis
-                    overlap = basis.conj().T @ basis
-                    evals, evecs = sp.linalg.eigh(Hr, overlap)
-                    answer_grid[y, x] = evals[0]
-
-            plt.imshow(np.abs((answer_grid - solution_grid).real))
-            plt.xlabel("Bz")
-            plt.ylabel("J")
-            plt.title("It 0")
-            plt.colorbar()
-            plt.show()
+            self._graph_solution_comparison(solution_grid, basis, chosen)
 
         # iteration
         num_iterations = len(not_chosen)
         for i in range(num_iterations):
-            overlap = basis.conj().T @ basis
+            overlap = (basis.conj().T @ basis).real
             max_res2 = -np.inf
             next_choice = None
             chosen_H_full = None
+            residues = []
             for j in not_chosen:
-                # construct Hr and H2r
+                # construct Hr and H2r on demand if needed
                 # technically H_full and H2_full only need to be constructed
                 # once, however, due to possible memory limitations based on
-                # the trianing grid size and full Hilbert space size, these
-                # are constructed on demand
-                H_full = self._build_H_full(j)
-                H2_full = self._build_H2_full(j)
+                # the training grid size and full Hilbert space size, these can
+                # be constructed on demand
+                if type(self.H_fulls) == type(None):
+                    H_full = self._build_H_full(j)
+                else:
+                    H_full = self.H_fulls[j]
+                if type(self.H2_fulls) == type(None):
+                    H2_full = self._build_H2_full(j)
+                else:
+                    H2_full = self.H2_fulls[j]
 
                 Hr = basis.conj().T @ H_full @ basis
                 H2r = basis.conj().T @ H2_full @ basis
-                evals, evecs = sp.linalg.eigh(Hr, overlap)
+                if self.sparse:
+                    evals, evecs = sps.linalg.eigh(Hr, overlap)
+                else:
+                    evals, evecs = sp.linalg.eigh(Hr, overlap)
 
                 # find degeneracy of the ground state
-                eps = 1e-8 # for comparing floating points of GSE
                 degeneracy = 0
+                eps = 1e-10 # for comparing floating points of GSE
                 for e in evals:
+                    # absolute value is not needed here, e >= evals[0]
                     if e - evals[0] < eps:
                         degeneracy += 1
                     else:
+                        break
+                    if degeneracy >= degeneracy_truncation:
                         break
 
                 # calculate residue
                 res2 = 0
                 for k in range(degeneracy):
-                    print(evals)
                     res2 += (
                         evecs[:, k].conj().T
-                        @ (H2r - evals[k] * evals[k] * overlap)
+                        @ (H2r - ((evals[k] * evals[k]) * overlap))
                         @ evecs[:, k]
                     )
-                print("Residue:", res2)
+
                 if(res2 < -1e-7):
                     print("Fail")
+
+                residues.append(res2)
 
                 if res2 > max_res2:
                     max_res2 = res2
@@ -219,16 +238,55 @@ class SurrogateModel:
                     chosen_H_full = H_full
 
             print("Max Residue", max_res2)
-            evals, evecs = np.linalg.eigh(chosen_H_full)
+            print("Number of residues calculated:", len(residues))
+
+            if self.sparse:
+                evals, evecs = sps.linalg.eigh(chosen_H_full)
+            else:
+                evals, evecs = sp.linalg.eigh(chosen_H_full)
+
+            if max_res2 < residue_threshold or len(chosen) >= 2**self.N - 1:
+                print("Optimization complete.")
+                plt.plot(not_chosen, np.array(residues).real, "o-")
+                plt.plot(
+                    [next_choice],
+                    [max_res2.real],
+                    "rx",
+                    label="Next Choice",
+                )
+                plt.xlabel("Training Grid Index")
+                plt.ylabel("Residue")
+                plt.title(f"Termination Residues")
+                plt.show()
+
+                if type(solution_grid) != type(None):
+                    self._graph_solution_comparison(
+                        solution_grid, basis, chosen
+                    )
+
+                break
+
+            plt.plot(not_chosen, np.array(residues).real, "o-")
+            plt.plot([next_choice], [max_res2.real], "rx", label="Next Choice")
+            plt.xlabel("Training Grid Index")
+            plt.ylabel("Residue")
+            plt.title(f"It {i + 1} Residues")
+            plt.show()
+
+            print("Full system size:", evals.shape[0])
+
             # find degeneracy of the ground state
-            eps = 1e-8 # for comparing floating points of GSE
+            eps = 1e-10 # for comparing floating points of GSE
             degeneracy = 0
             for e in evals:
                 if e - evals[0] < eps:
                     degeneracy += 1
                 else:
                     break
+                if degeneracy >= degeneracy_truncation:
+                    break
 
+            print("Degeneracy of chosen H_full ground state:", degeneracy)
             basis_addition = evecs[:, 0:degeneracy]
 
             # compress the basis
@@ -239,60 +297,110 @@ class SurrogateModel:
             U, sigmas, Vdagger = np.linalg.svd(projection)
             compress_add = 0
             for s in sigmas:
-                if(s > eps):
+                if s > svd_tolerance:
                     compress_add += 1
                 else:
                     break
 
             for j in range(compress_add):
                 basis_list += [U[:, j]]
-            basis = np.array(basis_list).T
 
+            basis_reduced = np.array(basis_list).T
+            print("Basis size before compression:", basis.shape[1])
+            print("Basis size after compression:", basis_reduced.shape[1])
+
+            if basis_reduced.shape[1] <= basis.shape[1]:
+                print(
+                    "Warning: Basis did not increase in size after compression."
+                )
+            else:
+                basis = copy.copy(basis_reduced)
+
+            print(
+                "Looking at solutions with current basis of size",
+                basis.shape[1]
+            )
             if type(solution_grid) != type(None):
-                answer_grid = np.zeros(solution_grid.shape, dtype=complex)
-                for y in range(solution_grid.shape[0]):
-                    for x in range(solution_grid.shape[1]):
-                        H_full = self._build_H_full(
-                            y * solution_grid.shape[1] + x
-                        )
-                        Hr = basis.conj().T @ H_full @ basis
-                        overlap = basis.conj().T @ basis
-                        evals, evecs = sp.linalg.eigh(Hr, overlap)
-                        answer_grid[y, x] = evals[0]
-                plt.imshow(
-                    np.abs((answer_grid - solution_grid).real) + 1e-20,
-                    norm=mcolors.LogNorm(vmin=1e-20, vmax=1),
+                self._graph_solution_comparison(
+                    solution_grid, basis, chosen, next_choice
                 )
-                plt.colorbar(
-                    norm=mcolors.LogNorm(
-                        vmin=1e-20, vmax=1
-                    )  # , ticks=[1e-20, 1e-10, 1e0]
-                )
-                plt.annotate("X", xy=(next_choice % 20, next_choice // 20))
-                plt.xlabel("U")
-                plt.ylabel("t")
-                plt.title(f"It {i + 1}")
-                plt.show()
 
             not_chosen.remove(next_choice)
             chosen.append(next_choice)
-            print(chosen)
-
-            if max_res2 < residue_threshold or len(chosen) >= self.size - 1:
-                break
 
         self.opt_basis = basis
         self.overlap = basis.conj().T @ basis
-        plt.imshow(self.overlap.real)
-        plt.colorbar()
-        plt.show()
         self.reduced_terms = None
 
-        if log_file:
-            log_file.close()
-
         return chosen, basis
-    
+
+    def _graph_solution_comparison(
+        self,
+        solution_grid: np.ndarray,
+        basis: np.ndarray,
+        chosen:  list[int],
+        next_choice: int = None
+    ):
+        answer_grid = np.zeros(
+            solution_grid[0].shape,
+            dtype=complex
+        )
+        for y in range(0, solution_grid[0].shape[0]):
+            for x in range(0, solution_grid[0].shape[1]):
+                if type(self.H_fulls) == type(None):
+                    H_full = self._build_H_full(
+                        y * solution_grid[0].shape[1] + x
+                    )
+                else:
+                    H_full = self.H_fulls[y * solution_grid[0].shape[1] + x]
+
+                Hr = basis.conj().T @ H_full @ basis
+                overlap = basis.conj().T @ basis
+                if self.sparse:
+                    evals, evecs = sps.linalg.eigh(Hr, overlap)
+                else:
+                    evals, evecs = sp.linalg.eigh(Hr, overlap)
+                answer_grid[y, x] = evals[0]
+
+        plt.imshow(
+            np.abs((answer_grid - solution_grid[0]).real) + 1e-14,
+            norm=mcolors.LogNorm(vmin=1e-14, vmax=1),
+        )
+        plt.colorbar(norm=mcolors.LogNorm(vmin=1e-14, vmax=1))
+
+        if type(next_choice) != type(None):
+            plt.scatter(
+                next_choice % solution_grid[0].shape[1],  # type: ignore
+                next_choice // solution_grid[0].shape[1],  # type: ignore
+                marker="x",
+                color="red",
+                s=20,
+                label="Next Choice",
+            )
+
+        plt.scatter(
+            np.array(chosen) % solution_grid[0].shape[1],
+            np.array(chosen) // solution_grid[0].shape[1],
+            marker="o",
+            color="orange",
+            s=20,
+            label="Chosen Points",
+        )
+        plt.xlabel(r"$\mu_2$")
+        plt.ylabel(r"$\mu_1$")
+        plt.title(f"Termination errors, Basis Size {basis.shape[1]}")
+        plt.xticks(
+            range(0, solution_grid[0].shape[1], 2),
+            labels=np.round(solution_grid[1], 2)[::2],
+            rotation=45,
+        )
+        plt.yticks(
+            range(0, solution_grid[0].shape[0], 2),
+            labels=np.round(solution_grid[1], 2)[::2],
+            rotation=45,
+        )
+        plt.show()
+
     def solve(
         self,
         parameters: list[complex]
@@ -303,7 +411,7 @@ class SurrogateModel:
         ):
             self.optimize()
 
-        if self.reduced_terms == None:
+        if type(self.reduced_terms) == type(None):
             self.reduced_terms = []
             for h in self.H_terms:
                 self.reduced_terms.append(
@@ -312,12 +420,15 @@ class SurrogateModel:
 
         Hr = np.zeros(
             (self.opt_basis.shape[1], self.opt_basis.shape[1]),
-            dtype = complex
+            dtype=complex
         )
 
         for p, h in zip(parameters, self.reduced_terms):
             Hr += p * h
-        
-        evals, evecs = sp.linalg.eigh(Hr, self.overlap)
-        
-        return evals[0]#, self.opt_basis @ evecs[:, 0]
+
+        if self.sparse:
+            evals, evecs = sps.linalg.eigh(Hr, self.overlap)
+        else:
+            evals, evecs = sp.linalg.eigh(Hr, self.overlap)
+
+        return evals[0]
