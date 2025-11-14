@@ -212,14 +212,14 @@ def gen_from_pauli_string(
                 mat = mat[:, basis][basis]
             return mat
         else:
-            mat = np.eye(2**N)
+            mat = np.eye(2**N, dtype=complex)
             if particle_selection is not None:
                 basis = get_ps_basis(particle_selection, N, ordering=ordering)
                 mat = mat[:, basis][basis]
             return mat
     else:
         op = QubitOperator(pauli_string)
-        # print(op)
+        print(pauli_string, op)
         if sparse:
             mat = get_sparse_operator(op, N).tocsc()
             if particle_selection is not None:

@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from math import comb
 import matplotlib.colors as mcolors
 import openfermion as of
+import os
 
 class SurrogateModel:
     """
@@ -22,12 +23,12 @@ class SurrogateModel:
 
     _SPARSE_LIMIT: int
 
+    model_name: str
     N: int
     pauli_strings: list[str]
     H_terms: list[np.ndarray]
     H2_terms: list[np.ndarray]
     H_fulls: list[np.ndarray]
-    H2_fulls: list[np.ndarray]
     training_grid: list[list[complex]]
     training_grid2: list[list[complex]]
     opt_basis: np.ndarray
@@ -40,13 +41,17 @@ class SurrogateModel:
 
     def __init__(
         self,
+        model_name: str,
         N: int,
         pauli_strings: list[str],
         training_grid: list[list[complex]],
         particle_selection: tuple[int, int] | int = None,
         basis_ordering: str = "uudd",
     ):
-        self._SPARSE_LIMIT = 8
+        self._SPARSE_LIMIT = 2
+
+        self.model_name = model_name
+
         self.N = N
         if self.N > self._SPARSE_LIMIT:
             self.sparse = True
@@ -57,7 +62,6 @@ class SurrogateModel:
         self.H_terms = None
         self.H2_terms = None
         self.H_fulls = None
-        self.H2_fulls = None
         self.training_grid = training_grid
         self.training_grid2 = None
         self.opt_basis = None
@@ -73,19 +77,50 @@ class SurrogateModel:
 
     def build_terms(
         self,
-        pregenerate_fulls: bool = False
+        pregenerate_fulls: bool = False,
+        save: bool = False,
+        log=False
     ):
         self.H_terms = []
         for pauli_string in self.pauli_strings:
-            self.H_terms.append(
-                gen_from_pauli_string(
-                    self.N,
-                    pauli_string,
-                    self.particle_selection,
-                    ordering=self.basis_ordering,
-                    sparse=self.sparse
-                ),
-            )
+            if save:
+                save_folder = self.model_name + "_" + "N" + "_" + str(self.N)
+                if pauli_string == "":
+                    filename = save_folder + "/I.bin"
+                else:
+                    filename = save_folder + "/" + pauli_string + ".bin"
+
+                try:
+                    H_term = np.fromfile(filename, dtype=float).reshape(
+                        (self.size, self.size)
+                    )
+                    self.H_terms.append(np.astype(H_term, complex))
+                except:
+                    self.H_terms.append(
+                        gen_from_pauli_string(
+                            self.N,
+                            pauli_string,
+                            self.particle_selection,
+                            ordering=self.basis_ordering,
+                            sparse=self.sparse
+                        ),
+                    )
+
+                    if not os.path.isdir(save_folder):
+                        os.mkdir(save_folder)
+                    
+                    np.astype(self.H_terms[-1], float).tofile(filename)
+
+            else:
+                self.H_terms.append(
+                    gen_from_pauli_string(
+                        self.N,
+                        pauli_string,
+                        self.particle_selection,
+                        ordering=self.basis_ordering,
+                        sparse=self.sparse
+                    ),
+                )
 
         self.H2_terms = []
         for h_i in self.H_terms:
@@ -102,10 +137,8 @@ class SurrogateModel:
 
         if pregenerate_fulls:
             self.H_fulls = []
-            self.H2_fulls = []
             for i in range(len(self.training_grid)):
                 self.H_fulls.append(self._build_H_full(i))
-                self.H2_fulls.append(self._build_H2_full(i))
 
     def _build_H_full(
         self,
@@ -117,23 +150,6 @@ class SurrogateModel:
 
         return H_full
 
-    def _build_H2_full(
-        self,
-        parameter_idx: int
-    ) -> np.ndarray:
-        """
-        H2_full = np.zeros((self.size, self.size), dtype=complex)
-        for mu2_i, h2_i in zip(
-            self.training_grid2[parameter_idx],
-            self.H2_terms
-        ):
-            H2_full += mu2_i * h2_i
-        """
-        
-        H_full = self._build_H_full(parameter_idx)
-
-        return H_full @ H_full
-
     def optimize(
         self,
         residue_threshold: float = 1e-6,
@@ -141,7 +157,24 @@ class SurrogateModel:
         solution_grid: tuple[np.ndarray, np.ndarray] = None,
         svd_tolerance: float = 1e-8,
         degeneracy_truncation: int = 5,
+        save=False
     ):
+        if save:
+            save_folder = self.model_name + "_" + "N" + "_" + str(self.N)
+            filename = save_folder + "/basis.bin"
+            try:
+                flat = np.astype(
+                    np.fromfile(filename, dtype=float),
+                    complex
+                )
+                num_basis_vecs = flat.shape[0] // self.size
+                self.opt_basis = flat.reshape(self.size, num_basis_vecs)
+                self.overlap = self.opt_basis.conj().T @ self.opt_basis
+
+                return self.opt_basis
+            except:
+                if not os.path.isdir(save_folder):
+                    os.mkdir(save_folder)
         # build terms if they are not already built
         if (
             type(self.H_terms) == type(None)
@@ -163,7 +196,7 @@ class SurrogateModel:
             else:
                 H_full = self.H_fulls[0]
             if self.sparse:
-                evals_evecs = sps.linalg.eigh(H_full)
+                evals, evecs = sps.linalg.eigsh(H_full.real)
             else:
                 evals, evecs = sp.linalg.eigh(H_full)
             init_vec = evecs[:, 0]
@@ -182,29 +215,23 @@ class SurrogateModel:
             overlap = (basis.conj().T @ basis).real
             max_res2 = -np.inf
             next_choice = None
-            chosen_H_full = None
             residues = []
-            for j in not_chosen:
-                # construct Hr and H2r on demand if needed
-                # technically H_full and H2_full only need to be constructed
-                # once, however, due to possible memory limitations based on
-                # the training grid size and full Hilbert space size, these can
-                # be constructed on demand
-                if type(self.H_fulls) == type(None):
-                    H_full = self._build_H_full(j)
-                else:
-                    H_full = self.H_fulls[j]
-                if type(self.H2_fulls) == type(None):
-                    H2_full = self._build_H2_full(j)
-                else:
-                    H2_full = self.H2_fulls[j]
+            Hr_terms = []
+            H2r_terms = []
 
-                Hr = basis.conj().T @ H_full @ basis
-                H2r = basis.conj().T @ H2_full @ basis
-                if self.sparse:
-                    evals, evecs = sps.linalg.eigh(Hr, overlap)
-                else:
-                    evals, evecs = sp.linalg.eigh(Hr, overlap)
+            for h in self.H_terms:
+                Hr_terms.append(basis.conj().T @ h @ basis)
+            for h2 in self.H2_terms:
+                    H2r_terms.append(basis.conj().T @ h2 @ basis)
+            for j in not_chosen:
+                Hr = np.zeros((basis.shape[1], basis.shape[1]), dtype=complex)
+                for p, hr in zip(self.training_grid[j], Hr_terms):
+                    Hr += p * hr
+                H2r = np.zeros((basis.shape[1], basis.shape[1]), dtype=complex)
+                for p2, h2r in zip(self.training_grid2[j], H2r_terms):
+                    H2r += p2 * h2r
+
+                evals, evecs = sp.linalg.eigh(Hr, overlap)
 
                 # find degeneracy of the ground state
                 degeneracy = 0
@@ -227,21 +254,22 @@ class SurrogateModel:
                         @ evecs[:, k]
                     )
 
-                if(res2 < -1e-7):
-                    print("Fail")
-
                 residues.append(res2)
 
                 if res2 > max_res2:
                     max_res2 = res2
                     next_choice = j
-                    chosen_H_full = H_full
 
             print("Max Residue", max_res2)
             print("Number of residues calculated:", len(residues))
 
+            if type(self.H_fulls) == type(None):
+                chosen_H_full = self._build_H_full(next_choice)
+            else:
+                chosen_H_full = self.H_fulls[next_choice]
+
             if self.sparse:
-                evals, evecs = sps.linalg.eigh(chosen_H_full)
+                evals, evecs = sps.linalg.eigsh(chosen_H_full.real)
             else:
                 evals, evecs = sp.linalg.eigh(chosen_H_full)
 
@@ -332,7 +360,10 @@ class SurrogateModel:
         self.overlap = basis.conj().T @ basis
         self.reduced_terms = None
 
-        return chosen, basis
+        if save:
+            np.astype(self.opt_basis, float).tofile(filename)
+
+        return basis
 
     def _graph_solution_comparison(
         self,
@@ -356,10 +387,7 @@ class SurrogateModel:
 
                 Hr = basis.conj().T @ H_full @ basis
                 overlap = basis.conj().T @ basis
-                if self.sparse:
-                    evals, evecs = sps.linalg.eigh(Hr, overlap)
-                else:
-                    evals, evecs = sp.linalg.eigh(Hr, overlap)
+                evals, evecs = sp.linalg.eigh(Hr, overlap)
                 answer_grid[y, x] = evals[0]
 
         plt.imshow(
@@ -403,7 +431,7 @@ class SurrogateModel:
 
     def solve(
         self,
-        parameters: list[complex]
+        parameters: list[complex],
     ) -> complex:
         if (
             type(self.opt_basis) == type(None)
@@ -426,9 +454,6 @@ class SurrogateModel:
         for p, h in zip(parameters, self.reduced_terms):
             Hr += p * h
 
-        if self.sparse:
-            evals, evecs = sps.linalg.eigh(Hr, self.overlap)
-        else:
-            evals, evecs = sp.linalg.eigh(Hr, self.overlap)
+        evals, evecs = sp.linalg.eigh(Hr, self.overlap)
 
         return evals[0]
