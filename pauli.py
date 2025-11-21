@@ -219,7 +219,6 @@ def gen_from_pauli_string(
             return mat
     else:
         op = QubitOperator(pauli_string)
-        print(pauli_string, op)
         if sparse:
             mat = get_sparse_operator(op, N).tocsc()
             if particle_selection is not None:

@@ -2,23 +2,6 @@ from surrogate import *
 from openfermion.hamiltonians import fermi_hubbard
 from openfermion.transforms import jordan_wigner
 
-"""
-    H_paulis = [
-        "X0X1", "Y0Y1",
-        "X1X2", "Y1Y2",
-        "X0X2", "Y0Y2",
-        "X3X4", "Y3Y4",
-        "X4X5", "Y4Y5",
-        "X3X5", "Y3Y5",
-        "Z0Z3",
-        "Z1Z4",
-        "Z2Z5"
-    ]
-    FH = fermi_hubbard(3, 1, 1, 1)
-    jw = jordan_wigner(FH)
-    print(jw.terms)
-"""
-
 if __name__ == "__main__":
     ###############################################################
     # Residue threshold for terminating optimization (lower means more accurate,
@@ -37,11 +20,11 @@ if __name__ == "__main__":
     # None or Between 0 and N (2*N for AIM, fermi_hubbard), N for
     # TFIM/TFXY/Heisenberg. Can be tuple for (n_up, n_down) for AIM,
     # fermi_hubbard
-    ps = None
+    ps = (2, 2)
 
     # AIM = Single Impurity Anderson Model, fermi_hubbard, TFIM, TFXY,
     # heisenberg
-    model_type = "fermi_hubbard"
+    model_type = "AIM"
 
     mu = np.linspace(-5, 5, 20)
 
@@ -132,15 +115,17 @@ if __name__ == "__main__":
                     + [-m2] * ((NB - (NB) % 2) // 2)
                 )
             model_paulis = model_to_paulis(N, model_type, model_parameters)
-            params = np.zeros(len(H_paulis), dtype=complex)
+            params = np.zeros(len(H_paulis), dtype=tuple)
 
+            print(H_paulis_order)
             for t in model_paulis:
                 try:
                     params[H_paulis_order[t[0]]] = t[1]
+                    print(H_paulis_order[t[0]])
                 except:
                     raise Exception("Failed to generate all terms in model")
 
-            if model_type == "AIM" or model_type == "fermi_hubbard":
+            if model_type == "asdasdfasdf":
                 model_paulis = list(zip(H_paulis, params))
                 id_loc = np.where(
                     np.array([t[0] for t in model_paulis]) == "")[0][0]
@@ -149,10 +134,12 @@ if __name__ == "__main__":
                     model_paulis[k][1]
                     for k in range(len(model_paulis)) if k != id_loc
                 ]
-                training_grid.append(grid_point)
+                training_grid.append(np.array(grid_point))
+                #training_grid.append(np.array(params))
             else:
                 model_paulis = list(zip(H_paulis, params))
                 training_grid.append([t[1] for t in model_paulis])
+            #training_grid.append(params)
 
     if model_type == "AIM" or model_type == "fermi_hubbard":
         surrogate_N = 2 * N
@@ -193,6 +180,7 @@ if __name__ == "__main__":
         ),  # Comment this out if no solution grid is desired
         svd_tolerance=svd_tol,
         residue_threshold=res_thresh,
+        processes=1
     )
     print("Basis Size", basis.shape[1])
 
